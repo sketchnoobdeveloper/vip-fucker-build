@@ -1,0 +1,170 @@
+name: Build VIP Fucker (private source)
+
+# This workflow lives in a PUBLIC repository and stores NO application source.
+# It checks out the PRIVATE source repository with a read-only, fine-grained
+# token supplied as the PRIVATE_REPO_TOKEN repository secret, discovers the
+# project's build requirements from its own files, builds the debug APK on a
+# public runner, and uploads ONLY the APK (plus a checksum) as an artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Branch, tag or commit in the private source repository'
+        required: false
+        default: 'main'
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: sketchnoobdeveloper/VIP-Fucker
+  SOURCE_DIR: source
+
+jobs:
+  build:
+    name: Build debug APK from private source
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Validate token secret
+        shell: bash
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PRIVATE_REPO_TOKEN:-}" ]; then
+            echo "::error::PRIVATE_REPO_TOKEN is missing. Add a fine-grained PAT with read-only Contents access to ${SOURCE_REPO}."
+            exit 1
+          fi
+          echo "Token present; value is never printed."
+
+      - name: Checkout private source with read-only token
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.source_ref || 'main' }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: ${{ env.SOURCE_DIR }}
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Discover build requirements from the source
+        id: detect
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+
+          # Java: highest explicit declaration found in the project's Gradle files.
+          # Includes the Gradle Java toolchain used for host-side tests.
+          JAVA_VERSION=$(grep -rhoE 'JavaVersion\.VERSION_[0-9]+|jvmTarget[[:space:]]*[=+][[:space:]]*"?[0-9]+"?|JavaLanguageVersion\.of\([0-9]+\)' \
+            --include='*.gradle' --include='*.gradle.kts' . 2>/dev/null \
+            | grep -oE '[0-9]+' | sort -n | tail -1 || true)
+          JAVA_VERSION=${JAVA_VERSION:-17}
+
+          COMPILE_SDK=$(grep -rhoE 'compileSdk[[:space:]]*[=+]?[[:space:]]*[0-9]+' \
+            --include='*.gradle' --include='*.gradle.kts' . 2>/dev/null \
+            | grep -oE '[0-9]+' | sort -n | tail -1 || true)
+          COMPILE_SDK=${COMPILE_SDK:-35}
+
+          MIN_SDK=$(grep -rhoE 'minSdk[[:space:]]*[=+]?[[:space:]]*[0-9]+' \
+            --include='*.gradle' --include='*.gradle.kts' . 2>/dev/null \
+            | grep -oE '[0-9]+' | sort -n | head -1 || true)
+          MIN_SDK=${MIN_SDK:-26}
+
+          # Gradle: the project has no wrapper, so read the pinned version from
+          # its own documented build requirements. Wrapper distributionUrl wins
+          # if a future revision adds one.
+          GRADLE_VERSION=$(grep -rhoE 'gradle-[0-9]+\.[0-9]+(\.[0-9]+)?|Gradle [0-9]+\.[0-9]+(\.[0-9]+)?' \
+            --include='*.md' --include='*.properties' --include='*.gradle' . 2>/dev/null \
+            | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | sort -uV | tail -1 || true)
+          GRADLE_VERSION=${GRADLE_VERSION:-8.11.1}
+
+          if [ -f gradlew ]; then
+            GRADLE_CMD='./gradlew'
+          else
+            GRADLE_CMD='gradle'
+          fi
+
+          echo "java_version=${JAVA_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "compile_sdk=${COMPILE_SDK}" >> "$GITHUB_OUTPUT"
+          echo "min_sdk=${MIN_SDK}" >> "$GITHUB_OUTPUT"
+          echo "gradle_version=${GRADLE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "gradle_cmd=${GRADLE_CMD}" >> "$GITHUB_OUTPUT"
+
+          # Only version metadata is emitted here; no source lines are printed.
+          echo "### Discovered build requirements" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Java: ${JAVA_VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Gradle: ${GRADLE_VERSION} (via ${GRADLE_CMD})" >> "$GITHUB_STEP_SUMMARY"
+          echo "- compileSdk: ${COMPILE_SDK}, minSdk: ${MIN_SDK}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up JDK ${{ steps.detect.outputs.java_version }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.detect.outputs.java_version }}
+          cache: gradle
+
+      - name: Set up Gradle ${{ steps.detect.outputs.gradle_version }}
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.detect.outputs.gradle_version }}
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER=$(find "$SDK_ROOT/cmdline-tools" -maxdepth 3 -type f -name sdkmanager 2>/dev/null | sort -V | tail -1)
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager not found under $SDK_ROOT/cmdline-tools"
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" --install \
+            "platforms;android-${{ steps.detect.outputs.compile_sdk }}" \
+            "build-tools;${{ steps.detect.outputs.compile_sdk }}.0.0" \
+            "platform-tools"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Build debug APK
+        shell: bash
+        working-directory: source
+        env:
+          GRADLE_OPTS: >-
+            -Dorg.gradle.jvmargs="-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8"
+            -Dorg.gradle.workers.max=2
+        run: |
+          set -euo pipefail
+          ${{ steps.detect.outputs.gradle_cmd }} :app:assembleDebug --no-daemon --max-workers=2 --stacktrace
+
+      - name: Verify APK and record checksum
+        id: apk
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          APK=$(find app/build/outputs/apk/debug -maxdepth 1 -name '*.apk' -type f | head -1)
+          if [ -z "$APK" ]; then
+            echo "::error::No APK produced"
+            exit 1
+          fi
+          ( cd "$(dirname "$APK")" && sha256sum "$(basename "$APK")" ) > "$RUNNER_TEMP/SHA256SUMS.txt"
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          echo "APK: $(basename "$APK") ($(du -h "$APK" | cut -f1))" >> "$GITHUB_STEP_SUMMARY"
+          echo "SHA-256: $(cut -d' ' -f1 "$RUNNER_TEMP/SHA256SUMS.txt")" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vip-fucker-debug-${{ github.sha }}
+          path: |
+            source/${{ steps.apk.outputs.path }}
+            ${{ runner.temp }}/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
