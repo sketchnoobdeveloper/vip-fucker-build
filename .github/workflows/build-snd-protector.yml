@@ -1,0 +1,132 @@
+name: Build SND Protector
+
+# Public build repository. Application source is checked out from the
+# private SND-Protector repository with a read-only token. No source is stored
+# in this repository or in the uploaded artifacts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Branch, tag or commit in the private SND-Protector repository'
+        required: false
+        default: 'main'
+        type: string
+      build_type:
+        description: 'APK variant to build'
+        required: false
+        default: 'both'
+        type: choice
+        options:
+          - release
+          - debug
+          - both
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: sketchnoobdeveloper/SND-Protector
+  SOURCE_DIR: source
+
+jobs:
+  build:
+    name: Build SND Protector APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Validate token secret
+        shell: bash
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PRIVATE_REPO_TOKEN:-}" ]; then
+            echo "::error::PRIVATE_REPO_TOKEN is missing in this repository's secrets."
+            exit 1
+          fi
+          echo "Token present; value is never printed."
+
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.source_ref || 'main' }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: ${{ env.SOURCE_DIR }}
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER=$(find "$SDK/cmdline-tools" -maxdepth 3 -type f -name sdkmanager 2>/dev/null | sort -V | tail -1)
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager not found under $SDK/cmdline-tools"
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" --install \
+            "platforms;android-35" \
+            "build-tools;34.0.0" \
+            "platform-tools" >/dev/null
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+      - name: Download pinned dependencies
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          python3 tools/dependencies.py
+
+      - name: Build release APK
+        if: ${{ inputs.build_type == 'release' || inputs.build_type == 'both' }}
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          bash build.sh
+          mkdir -p dist
+          cp build/snd.apk dist/
+          ( cd dist && sha256sum snd.apk > SHA256SUMS-release.txt )
+
+      - name: Build debug APK
+        if: ${{ inputs.build_type == 'debug' || inputs.build_type == 'both' }}
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          bash build.sh --debug
+          mkdir -p dist
+          cp build/snd-protector-1.0.0-debug.apk dist/
+          ( cd dist && sha256sum snd-protector-1.0.0-debug.apk > SHA256SUMS-debug.txt )
+
+      - name: Verify APK signatures
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          for apk in dist/*.apk; do
+            "$SDK/build-tools/34.0.0/apksigner" verify --min-sdk-version 24 "$apk"
+            echo "Verified $apk"
+          done
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: snd-protector-${{ inputs.build_type }}-${{ github.sha }}
+          path: source/dist/
+          if-no-files-found: error
+          retention-days: 30
